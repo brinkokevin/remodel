@@ -5,8 +5,14 @@ use std::{
 };
 
 use mlua::{FromLua, Lua, MetaMethod, ToLua, UserData, UserDataMethods};
-use rbx_dom_weak::{types::Ref, InstanceBuilder, WeakDom};
+use rbx_dom_weak::{
+	types::{Attributes, Ref, Variant, VariantType}, 
+	InstanceBuilder, 
+	WeakDom
+};
 use rbx_reflection::ClassTag;
+
+use crate::value::{guess_type_from_rbxvalue, lua_to_rbxvalue, rbxvalue_to_lua};
 
 #[derive(Clone)]
 pub struct LuaInstance {
@@ -84,6 +90,126 @@ impl LuaInstance {
         }
 
         tree.destroy(self.id);
+
+        Ok(())
+    }
+
+    fn get_attribute<'lua>(
+        &self,
+        context: &'lua Lua,
+        attribute_name: &str,
+    ) -> mlua::Result<Option<mlua::Value<'lua>>> {
+        let tree = self.tree.lock().unwrap();
+
+        let instance = tree.get_by_ref(self.id).ok_or_else(|| {
+            mlua::Error::external("Cannot call GetAttribute() on a destroyed instance")
+        })?;
+
+        let attribute_binary_string = match instance.properties.get("AttributesSerialize") {
+            Some(Variant::BinaryString(bytes)) => bytes,
+            Some(other) => {
+                return Err(mlua::Error::external(format!(
+                    "AttributesSerialize is `{:?}`, not a BinaryString",
+                    other,
+                )))
+            }
+            None => return Ok(None),
+        };
+
+        let attribute_bytes: &[u8] = attribute_binary_string.as_ref();
+
+        if attribute_bytes.is_empty() {
+            return Ok(None);
+        }
+
+        let mut attributes = Attributes::from_reader(attribute_bytes).map_err(|error| {
+            mlua::Error::external(format!("Attributes could not be deserialized: {}", error))
+        })?;
+
+        rbxvalue_to_lua(
+            context,
+            &match attributes.remove(attribute_name) {
+                Some(variant) => match variant {
+                    Variant::BinaryString(binary) => {
+                        Variant::String(String::from_utf8_lossy(binary.as_ref()).into_owned())
+                    }
+                    other => other,
+                },
+                None => return Ok(None),
+            },
+        )
+        .map(Some)
+    }
+
+    fn set_attribute<'lua>(
+        &self,
+        context: &'lua Lua,
+        attribute_name: &str,
+        value: mlua::Value<'lua>,
+    ) -> mlua::Result<()> {
+        let mut tree = self.tree.lock().unwrap();
+
+        let instance = tree.get_by_ref_mut(self.id).ok_or_else(|| {
+            mlua::Error::external("Cannot call GetAttribute() on a destroyed instance")
+        })?;
+
+        let mut attributes = match instance.properties.get("AttributesSerialize") {
+            Some(Variant::BinaryString(bytes)) => {
+                let attribute_bytes: &[u8] = bytes.as_ref();
+                Attributes::from_reader(attribute_bytes).map_err(|error| {
+                    mlua::Error::external(format!(
+                        "Attributes could not be deserialized: {}",
+                        error
+                    ))
+                })?
+            }
+            Some(other) => {
+                return Err(mlua::Error::external(format!(
+                    "AttributesSerialize is `{:?}`, not a BinaryString",
+                    other,
+                )))
+            }
+            None => Attributes::new(),
+        };
+
+        if matches!(value, mlua::Value::Nil) {
+            attributes.remove(attribute_name);
+        } else {
+            let guessed_type = guess_type_from_rbxvalue(&value).ok_or_else(|| {
+                mlua::Error::external(format!("{:?} is not a valid attribute value", value))
+            })?;
+
+            let (variant_type, value) = match (guessed_type, value) {
+                (VariantType::String, value) => (
+                    VariantType::BinaryString,
+                    // I think I made a mistake with base64 :/
+                    mlua::Value::String(context.create_string(&base64::encode(match value {
+                        mlua::Value::String(string) => string,
+                        _ => unreachable!(),
+                    }))?),
+                ),
+
+                other @ _ => other,
+            };
+
+            attributes.insert(
+                attribute_name.to_owned(),
+                lua_to_rbxvalue(variant_type, value)?,
+            );
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        attributes.to_writer(&mut buffer).map_err(|error| {
+            mlua::Error::external(format!(
+                "There was an error while setting the attribute: {}",
+                error,
+            ))
+        })?;
+
+        instance.properties.insert(
+            "AttributesSerialize".to_owned(),
+            Variant::BinaryString(buffer.into()),
+        );
 
         Ok(())
     }
@@ -391,6 +517,17 @@ impl UserData for LuaInstance {
         methods.add_method("ClearAllChildren", |_context, this, _args: ()| {
             this.clear_all_children()
         });
+
+        methods.add_method("GetAttribute", |context, this, attribute: String| {
+            this.get_attribute(context, &attribute)
+        });
+
+        methods.add_method(
+            "SetAttribute",
+            |context, this, (attribute, value): (String, mlua::Value<'_>)| {
+                this.set_attribute(context, &attribute, value)
+            },
+        );
 
         methods.add_method("Clone", |_context, this, _args: ()| this.clone_instance());
 

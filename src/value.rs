@@ -55,6 +55,22 @@ pub fn rbxvalue_to_lua<'lua>(context: &'lua Lua, value: &Variant) -> LuaResult<L
     }
 }
 
+pub fn guess_type_from_rbxvalue(value: &LuaValue<'_>) -> Option<VariantType> {
+    match value {
+        mlua::Value::Boolean(_) => Some(VariantType::Bool),
+        mlua::Value::Integer(_) | mlua::Value::Number(_) => Some(VariantType::Float64),
+        mlua::Value::String(_) => Some(VariantType::String),
+        mlua::Value::UserData(userdata) => {
+            if userdata.is::<Vector3int16Value>() {
+                Some(VariantType::Vector3)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn lua_to_rbxvalue(ty: VariantType, value: LuaValue<'_>) -> LuaResult<Variant> {
     match (ty, value) {
         (VariantType::String, LuaValue::String(lua_string)) => {
